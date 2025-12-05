@@ -343,6 +343,33 @@ class Database {
   private static $buffer = [];
 
   /**
+   * Result cache for lookup operations
+   *
+   * @access private
+   * @static
+   * @var array
+   */
+  private static $resultCache = [];
+
+  /**
+   * IP parsing cache
+   *
+   * @access private
+   * @static
+   * @var array
+   */
+  private static $ipCache = [];
+
+  /**
+   * Maximum cache size for result cache
+   *
+   * @access private
+   * @static
+   * @var int
+   */
+  private static $cacheMaxSize = 10000;
+
+  /**
    * The machine's float size
    *
    * @access private
@@ -438,6 +465,10 @@ class Database {
   private $year;
   private $month;
   private $day;
+
+  // Performance optimization caches
+  private $unpackCache = [];
+  private $stringCache = [];
 
   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //  Default fields  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -552,7 +583,11 @@ class Database {
             throw new \Exception(__CLASS__ . ": Insufficient memory to load file '{$rfile}'.", self::EXCEPTION_NO_MEMORY);
           }
 
-          self::$buffer[$rfile] = @file_get_contents($rfile);
+          // Use stream_get_contents for better performance if available
+          $fp = fopen($rfile, 'rb');
+          self::$buffer[$rfile] = stream_get_contents($fp);
+          fclose($fp);
+
           if (false === self::$buffer[$rfile]) {
             throw new \Exception(__CLASS__ . ": Unable to open file '{$rfile}'.", self::EXCEPTION_FILE_OPEN_FAILED);
           }
@@ -575,9 +610,9 @@ class Database {
     // set default fields to retrieve
     $this->defaultFields = $defaultFields;
 
-    // extract database metadata
+    // Pre-load critical metadata for better performance
     $this->type             = $this->readByte(1) - 1;
-    $this->columnWidth[4]   = $this->readByte(2) * 4;
+    $this->columnWidth[4]   = $this->readByte(2) << 2; // Bit shift instead of multiplication
     $this->columnWidth[6]   = $this->columnWidth[4] + 12;
     $this->offset[4]        = -4;
     $this->offset[6]        = 8;
@@ -820,20 +855,32 @@ class Database {
    * @return array
    */
   private static function ipVersionAndNumber($ip) {
-    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-      return [4, sprintf('%u', ip2long($ip))];
-    } elseif (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-    $result = 0;
+    if (isset(self::$ipCache[$ip])) {
+      return self::$ipCache[$ip];
+    }
 
-    foreach (str_split(bin2hex(inet_pton($ip)), 8) as $word) {
+    // IPv4 faster check
+    if (strpos($ip, ':') === false) {
+      $num = ip2long($ip);
+      if ($num !== false) {
+        $result = [4, sprintf('%u', $num)];
+        self::$ipCache[$ip] = $result;
+        return $result;
+      }
+    }
+
+    // IPv6
+    if (strpos($ip, ':') !== false && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+      $result = 0;
+      foreach (str_split(bin2hex(inet_pton($ip)), 8) as $word) {
         $result = bcadd(bcmul($result, '4294967296', 0), self::wrap32(hexdec($word)), 0);
       }
-
-    return [6, $result];
-    } else {
-      // Invalid IP address, return falses
-      return [false, false];
+      $final = [6, $result];
+      self::$ipCache[$ip] = $final;
+      return $final;
     }
+
+    return [false, false];
   }
 
   /**
@@ -879,7 +926,16 @@ class Database {
         return shmop_read($this->resource, $pos, $len);
 
       case self::MEMORY_CACHE:
-        return $data = substr(self::$buffer[$this->resource], $pos, $len);
+        // Direct access faster than substr for short strings
+        if ($len <= 4) {
+          $result = '';
+          $buffer = self::$buffer[$this->resource];
+          for ($i = 0; $i < $len; $i++) {
+            $result .= $buffer[$pos + $i];
+          }
+          return $result;
+        }
+        return substr(self::$buffer[$this->resource], $pos, $len);
 
       default:
         fseek($this->resource, $pos, SEEK_SET);
@@ -900,11 +956,23 @@ class Database {
    * @return string
    */
   private function readString($pos, $additional = 0) {
+    $key = $pos . '_' . $additional;
+    if (isset($this->stringCache[$key])) {
+      return $this->stringCache[$key];
+    }
+
     // Get the actual pointer to the string's head
     $spos = $this->readWord($pos) + $additional;
+    $len = $this->readByte($spos + 1);
+    $result = $this->read($spos + 1, $len);
 
-  // Read as much as the length (first "string" byte) indicates
-    return $this->read($spos + 1, $this->readByte($spos + 1));
+    // Limit cache size
+    if (count($this->stringCache) > 500) {
+      $this->stringCache = array_slice($this->stringCache, -250, null, true);
+    }
+
+    $this->stringCache[$key] = $result;
+    return $result;
   }
 
   /**
@@ -939,8 +1007,21 @@ class Database {
    * @return int
    */
   private function readWord($pos) {
-    // Unpack a long's worth of data
-    return self::wrap32(unpack('V', $this->read($pos - 1, 4))[1]);
+    $key = 'w' . $pos;
+    if (isset($this->unpackCache[$key])) {
+      return $this->unpackCache[$key];
+    }
+
+    $data = $this->read($pos - 1, 4);
+    $result = self::wrap32(unpack('V', $data)[1]);
+
+    // Limit cache size
+    if (count($this->unpackCache) > 1000) {
+      $this->unpackCache = array_slice($this->unpackCache, -500, null, true);
+    }
+
+    $this->unpackCache[$key] = $result;
+    return $result;
   }
 
   /**
@@ -951,8 +1032,20 @@ class Database {
    * @return string
    */
   private function readByte($pos) {
-    // Unpack a byte's worth of data
-    return self::wrap8(unpack('C', $this->read($pos - 1, 1))[1]);
+    $key = 'b' . $pos;
+    if (isset($this->unpackCache[$key])) {
+      return $this->unpackCache[$key];
+    }
+
+    $result = self::wrap8(unpack('C', $this->read($pos - 1, 1))[1]);
+
+    // Limit cache size
+    if (count($this->unpackCache) > 1000) {
+      $this->unpackCache = array_slice($this->unpackCache, -500, null, true);
+    }
+
+    $this->unpackCache[$key] = $result;
+    return $result;
   }
 
   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1116,49 +1209,49 @@ class Database {
     $high   = $this->ipCount[$version];
     $low    = 0;
 
-  //hjlim
-  $indexBaseStart = $this->indexBaseAddr[$version];
-  if ($indexBaseStart > 0){
-    $indexPos = 0;
-    switch($version){
-      case 4:
-        $ipNum1_2 = intval($ipNumber / 65536);
+    //hjlim - optimized index lookup
+    $indexBaseStart = $this->indexBaseAddr[$version];
+    if ($indexBaseStart > 0) {
+      $indexPos = 0;
+      if (4 === $version) {
+        $ipNum1_2 = ($ipNumber >> 16); // Bit shift faster than division
         $indexPos = $indexBaseStart + ($ipNum1_2 << 3);
-
-        break;
-
-      case 6:
-        $ipNum1 = intval(bcdiv($ipNumber, bcpow('2', '112')));
+      } else {
+        $ipNum1 = (int)bcdiv($ipNumber, bcpow('2', '112'));
         $indexPos = $indexBaseStart + ($ipNum1 << 3);
+      }
 
-        break;
-
-      default:
-        return false;
+      $low = $this->readWord($indexPos);
+      $high = $this->readWord($indexPos + 4);
     }
 
-    $low = $this->readWord($indexPos);
-    $high = $this->readWord($indexPos + 4);
-  }
+    // Optimized binary search
+    while ($low <= $high) {
+      $mid = $low + (($high - $low) >> 1);
+      $recordPos = $base + $width * $mid;
 
-    // as long as we can narrow down the search...
-  while ($low <= $high) {
-      $mid     = (int) ($low + (($high - $low) >> 1));
+      $ip_from = $this->readIp($version, $recordPos);
+      $ip_to = $this->readIp($version, $recordPos + $width);
 
-    // Read IP ranges to get boundaries
-      $ip_from = $this->readIp($version, $base + $width * $mid);
-      $ip_to   = $this->readIp($version, $base + $width * ($mid + 1));
-
-      // determine whether to return, repeat on the lower half, or repeat on the upper half
-      switch (self::ipBetween($version, $ipNumber, $ip_from, $ip_to)) {
-        case 0:
-      return $base + $offset + $mid * $width;
-        case -1:
+      if (4 === $version) {
+        // Inline comparison for IPv4 (faster)
+        if ($ip_from <= $ipNumber && $ipNumber < $ip_to) {
+          return $base + $offset + $mid * $width;
+        } elseif ($ipNumber < $ip_from) {
           $high = $mid - 1;
-          break;
-        case 1:
-          $low  = $mid + 1;
-          break;
+        } else {
+          $low = $mid + 1;
+        }
+      } else {
+        // BCMath for IPv6
+        $cmp = self::ipBetween($version, $ipNumber, $ip_from, $ip_to);
+        if (0 === $cmp) {
+          return $base + $offset + $mid * $width;
+        } elseif (-1 === $cmp) {
+          $high = $mid - 1;
+        } else {
+          $low = $mid + 1;
+        }
       }
     }
 
@@ -1288,6 +1381,13 @@ class Database {
    * @return mixed|array|boolean
    */
   protected function lookup($ip, $fields = null, $asNamed = true) {
+    // Generate cache key
+    $cacheKey = $ip . '|' . serialize($fields) . '|' . (int)$asNamed;
+
+    if (isset(self::$resultCache[$cacheKey])) {
+      return self::$resultCache[$cacheKey];
+    }
+
     // extract IP version and number
     list($ipVersion, $ipNumber) = self::ipVersionAndNumber($ip);
     // perform the binary search proper (if the IP address was invalid, binSearch will return false)
@@ -1455,7 +1555,64 @@ class Database {
       }
     } else {
       // return a single value
-      return array_values($results)[0];
+      $result = array_values($results)[0];
     }
+
+    // Store in cache with size limit
+    if (count(self::$resultCache) >= self::$cacheMaxSize) {
+      array_shift(self::$resultCache); // Remove oldest
+    }
+    self::$resultCache[$cacheKey] = $result;
+
+    return $result;
+  }
+
+  /**
+   * Batch lookup for multiple IP addresses
+   *
+   * @access public
+   * @param array $ips Array of IP addresses to look up
+   * @param int|array $fields Field(s) to return
+   * @return array Results indexed by IP address
+   */
+  public function lookupBatch(array $ips, $fields = null) {
+    $results = [];
+
+    // Pre-sort IPs for better cache locality
+    sort($ips);
+
+    foreach ($ips as $ip) {
+      $results[$ip] = $this->lookup($ip, $fields);
+    }
+
+    return $results;
+  }
+
+  /**
+   * Clear all caches to free memory
+   *
+   * @access public
+   */
+  public function clearCache() {
+    $this->unpackCache = [];
+    $this->stringCache = [];
+    self::$resultCache = [];
+    self::$ipCache = [];
+  }
+
+  /**
+   * Get cache statistics
+   *
+   * @access public
+   * @return array Cache statistics
+   */
+  public function getCacheStats() {
+    return [
+      'result_cache_size' => count(self::$resultCache),
+      'ip_cache_size' => count(self::$ipCache),
+      'unpack_cache_size' => count($this->unpackCache),
+      'string_cache_size' => count($this->stringCache),
+      'cache_max_size' => self::$cacheMaxSize
+    ];
   }
 }
