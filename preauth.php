@@ -55,18 +55,33 @@ try {
         if ($proxyInfo && isset($proxyInfo['isProxy']) && $proxyInfo['isProxy'] >= 1) {
             $proxyType = isset($proxyInfo['proxyType']) ? $proxyInfo['proxyType'] : 'Unknown';
 
-            // Block specific proxy types
-            $blockedProxyTypes = array('VPN', 'TOR', 'DCH', 'PUB', 'WEB', 'SES');
+            // Whitelist for popular DNS servers (they show as DCH but are legitimate)
+            $dnsWhitelist = array(
+                '8.8.8.8', '8.8.4.4',     // Google DNS
+                '1.1.1.1', '1.0.0.1',     // Cloudflare DNS
+                '208.67.222.222', '208.67.220.220', // OpenDNS
+                '9.9.9.9', '149.112.112.112',       // Quad9 DNS
+                '4.2.2.1', '4.2.2.2',     // Level3 DNS
+                '199.85.126.10', '199.85.127.10'    // Norton DNS
+            );
 
-            if (in_array($proxyType, $blockedProxyTypes)) {
-                $isBot = true;
-                $botInfo = array(
-                    'proxy_type' => $proxyType,
-                    'usage_type' => isset($proxyInfo['usageType']) ? $proxyInfo['usageType'] : 'Unknown',
-                    'country' => isset($proxyInfo['countryName']) ? $proxyInfo['countryName'] : 'Unknown',
-                    'isp' => isset($proxyInfo['isp']) ? $proxyInfo['isp'] : 'Unknown',
-                    'reason' => 'Blocked due to proxy type'
-                );
+            // Skip blocking for whitelisted DNS servers
+            if (in_array($ipAddress, $dnsWhitelist)) {
+                // Allow DNS servers even if they show as proxies
+            } else {
+                // Block specific proxy types
+                $blockedProxyTypes = array('VPN', 'TOR', 'DCH', 'PUB', 'WEB', 'SES');
+
+                if (in_array($proxyType, $blockedProxyTypes)) {
+                    $isBot = true;
+                    $botInfo = array(
+                        'proxy_type' => $proxyType,
+                        'usage_type' => isset($proxyInfo['usageType']) ? $proxyInfo['usageType'] : 'Unknown',
+                        'country' => isset($proxyInfo['countryName']) ? $proxyInfo['countryName'] : 'Unknown',
+                        'isp' => isset($proxyInfo['isp']) ? $proxyInfo['isp'] : 'Unknown',
+                        'reason' => 'Blocked due to proxy type'
+                    );
+                }
             }
         }
 } catch (Exception $e) {
